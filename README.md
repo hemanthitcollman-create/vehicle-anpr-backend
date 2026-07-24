@@ -16,38 +16,82 @@ vehicle-anpr-backend/
 └── README.md
 ```
 
+# Vehicle Number Plate Recognition (ANPR) Backend
+
+FastAPI backend that detects and reads vehicle number plates from
+uploaded images using **fast-alpr** (a YOLOv9 plate detector + OCR
+model, both running on ONNX Runtime — no PyTorch, so it stays light
+on RAM and works well on low-memory hosting tiers).
+
+## Project structure
+
+```
+vehicle-anpr-backend/
+├── main.py            # FastAPI app
+├── requirements.txt    # Python dependencies
+├── Dockerfile          # Container build used by Railway
+├── railway.json        # Railway build/deploy config
+├── .gitignore
+└── README.md
+```
+
 ## API
 
-| Method | Path            | Description                              |
-|--------|-----------------|-------------------------------------------|
-| GET    | `/health`       | Health check (used by Railway)            |
-| GET    | `/`             | Basic info message                        |
-| POST   | `/detect-plate` | Upload an image, get detected plate text  |
+| Method | Path                  | Auth required | Description                              |
+|--------|-----------------------|:--------------:|-------------------------------------------|
+| GET    | `/health`             | No             | Health check (used by Railway)            |
+| GET    | `/`                   | No             | Basic info message                        |
+| POST   | `/detect-plate`       | Yes            | Upload ONE image, get detected plate text |
+| POST   | `/detect-plate-batch` | Yes            | Upload MULTIPLE images (max 10) at once   |
 
-**Example request:**
+### Authentication
+
+Protected endpoints require a header:
+```
+x-api-key: <your key>
+```
+The expected key is read from the `API_KEY` environment variable.
+**If `API_KEY` is not set, auth is disabled** — fine for local testing,
+but always set it before making the backend public (see step 3 below).
+
+**Example single-image request:**
 ```bash
 curl -X POST "https://<your-app>.up.railway.app/detect-plate" \
+  -H "x-api-key: YOUR_SECRET_KEY" \
   -F "file=@car.jpg"
 ```
 
 **Example response:**
 ```json
 {
-  "plate_regions_found": 1,
+  "filename": "car.jpg",
+  "plates_found": 1,
   "best_match": {
-    "text": "KA01AB1234",
-    "confidence": 0.87,
-    "normalized": "KA01AB1234"
+    "plate_text": "TN39BU6084",
+    "detection_confidence": 0.882,
+    "ocr_confidence": 0.999,
+    "bounding_box": {"x1": 206, "y1": 730, "x2": 389, "y2": 785}
   },
-  "all_detected_text": [
-    {"text": "KA01AB1234", "confidence": 0.87}
-  ]
+  "all_detections": [ /* one entry per plate found in the image */ ]
 }
 ```
 
-> The regex in `main.py` (`PLATE_PATTERN`) is set up for Indian plate
-> formats (e.g. `KA01AB1234`). Edit it if you need a different
-> country's format.
+**Example batch request (multiple images in one call):**
+```bash
+curl -X POST "https://<your-app>.up.railway.app/detect-plate-batch" \
+  -H "x-api-key: YOUR_SECRET_KEY" \
+  -F "files=@car1.jpg" \
+  -F "files=@car2.jpg" \
+  -F "files=@car3.jpg"
+```
+Response is `{"count": 3, "results": [...]}`, one result object per
+uploaded file, in the same shape as the single-image response (each
+also includes an `"error"` field instead if that particular file
+failed or wasn't an image).
+
+> Batch requests are capped at **10 files** per call (`MAX_BATCH_SIZE`
+> in `main.py`) to keep any single request from tying up the server or
+> using too much memory. Raise or lower this if needed.
 
 ---
 
@@ -57,9 +101,11 @@ curl -X POST "https://<your-app>.up.railway.app/detect-plate" \
 python -m venv venv
 source venv/bin/activate      # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-uvicorn main:app --reload
+API_KEY=devkey123 uvicorn main:app --reload
 ```
-Visit `http://127.0.0.1:8000/docs` for the interactive Swagger UI.
+Visit `http://127.0.0.1:8000/docs` for the interactive Swagger UI. In
+Swagger, click the padlock icon (or use "Try it out") to enter your
+API key before calling protected endpoints.
 
 ---
 
@@ -67,72 +113,54 @@ Visit `http://127.0.0.1:8000/docs` for the interactive Swagger UI.
 
 ```bash
 cd vehicle-anpr-backend
-git init
 git add .
-git commit -m "Initial commit: ANPR backend"
-
-# Create a new repo on GitHub first (via github.com or gh CLI), then:
-git branch -M main
-git remote add origin https://github.com/<your-username>/vehicle-anpr-backend.git
-git push -u origin main
-```
-
-Using GitHub CLI instead:
-```bash
-gh repo create vehicle-anpr-backend --public --source=. --remote=origin --push
-```
-
----
-
-## 3. Deploy on Railway
-
-**Option A — Railway dashboard (recommended for first deploy)**
-1. Go to [railway.app](https://railway.app) and log in.
-2. Click **New Project → Deploy from GitHub repo**.
-3. Select your `vehicle-anpr-backend` repository.
-4. Railway detects the `Dockerfile` automatically and builds the image.
-5. Once deployed, go to **Settings → Networking → Generate Domain**
-   to get a public URL like `https://vehicle-anpr-backend.up.railway.app`.
-6. Test it: `GET https://<your-domain>/health` should return `{"status": "ok"}`.
-
-**Option B — Railway CLI**
-```bash
-npm install -g @railway/cli
-railway login
-railway init
-railway up
-railway domain   # generates a public URL
-```
-
-### Environment variables
-No required env vars for this project — Railway automatically injects
-`PORT`, which `main.py`/Dockerfile already read. Add any of your own
-(e.g. an API key to protect the endpoint) via **Settings → Variables**
-on Railway.
-
-### Resource notes
-- EasyOCR downloads its recognition model (~65 MB) the first time
-  `/detect-plate` is called, so the **first request after a deploy or
-  restart will be slow** (10–30s). Later requests are fast.
-- EasyOCR pulls in PyTorch, so the build is a few hundred MB — pick at
-  least Railway's default plan; the free trial tier usually has enough
-  RAM (≥512 MB recommended, 1 GB+ preferred).
-
----
-
-## 4. Redeploying after changes
-
-Railway auto-deploys on every push to your connected branch:
-```bash
-git add .
-git commit -m "Update detection logic"
+git commit -m "Add API key auth, batch endpoint, upgraded plate detector"
 git push
 ```
+(If this is a brand-new repo instead of an update, see the git init /
+remote add steps from your first setup.)
 
 ---
 
-## Notes / next steps you may want
-- Add an API key check (e.g. a header `x-api-key`) before exposing this publicly.
-- Swap the Haar cascade for a YOLOv8-based plate detector if you need
-  higher accuracy on angled/dirty/far-away plates.
-- Add a `/detect-plate` rate limit if this will be public-facing.
+## 3. Set your API key on Railway (do this before going live)
+
+1. Open your service on Railway → **Variables** tab
+2. Add a new variable: `API_KEY` = *(pick a long random string, e.g.
+   generate one with `openssl rand -hex 32`)*
+3. Save — Railway will redeploy automatically
+4. Keep this key secret; anyone with it can call your endpoints. Share
+   it only with whatever frontend/service is meant to call this API.
+
+Without this step, your endpoints are open to anyone who finds your
+URL.
+
+---
+
+## 4. Deploy / redeploy on Railway
+
+Railway auto-deploys on every push to your connected branch — just
+`git push` and watch the **Deployments** tab. First deploy after this
+update will reinstall dependencies (fast-alpr instead of the old
+OCR stack), so it may take a few minutes; after that, redeploys are
+fast.
+
+### Resource notes
+- fast-alpr downloads its ONNX model files (~10MB total) the first
+  time `/detect-plate` is called after a deploy/restart, so the
+  **first request will take a few extra seconds**. After that it's
+  fast (well under 1s per image on CPU).
+- Peak memory usage is roughly 150–200MB for the model + inference,
+  much lighter than a PyTorch-based OCR stack — should run
+  comfortably even on Railway's free/trial tier.
+
+---
+
+## Notes / possible next steps
+- Tighten CORS (`allow_origins=["*"]`) to your actual frontend's
+  domain once you have one.
+- Add per-key rate limiting if this becomes public-facing.
+- The bundled detector/OCR models are general-purpose; if you need
+  higher accuracy for a specific plate format or camera setup, you
+  can fine-tune your own YOLO model and point `ALPR(detector_model=...)`
+  at it — see the [fast-alpr docs](https://github.com/ankandrew/fast-alpr).
+
