@@ -69,12 +69,19 @@ def read_image(file_bytes: bytes) -> np.ndarray:
 
 
 def locate_plate_regions(img: np.ndarray):
-    """Return a list of cropped candidate plate regions (numpy arrays)."""
+    """Return a list of cropped candidate plate regions (numpy arrays).
+
+    Tries the Haar cascade first (fast, but trained on Russian-style
+    plates so it often misses others), then falls back to a classical
+    contour-based method that looks for a bright, rectangular,
+    high-contrast region -- which is what a plate looks like against a
+    car body/bumper. This catches most real-world plate photos.
+    """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
+    eq = cv2.equalizeHist(gray)
 
     cascade = get_plate_cascade()
-    plates = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(60, 20))
+    plates = cascade.detectMultiScale(eq, scaleFactor=1.1, minNeighbors=4, minSize=(60, 20))
 
     crops = []
     for (x, y, w, h) in plates:
@@ -83,16 +90,55 @@ def locate_plate_regions(img: np.ndarray):
         x2, y2 = min(img.shape[1], x + w + pad_x), min(img.shape[0], y + h + pad_y)
         crops.append(img[y1:y2, x1:x2])
 
-    return crops
+    if crops:
+        return crops
+
+    return _contour_based_plate_regions(img, gray)
+
+
+def _contour_based_plate_regions(img: np.ndarray, gray: np.ndarray):
+    blurred = cv2.bilateralFilter(gray, 13, 15, 15)
+    edged = cv2.Canny(blurred, 30, 200)
+    edged = cv2.dilate(edged, np.ones((3, 3), np.uint8), iterations=1)
+
+    contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:15]
+
+    img_h, img_w = gray.shape[:2]
+    candidates = []
+
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        if h == 0:
+            continue
+        aspect_ratio = w / h
+        area_fraction = (w * h) / (img_w * img_h)
+
+        # A plate is a wide rectangle, not too small, not the whole photo.
+        if 2.0 <= aspect_ratio <= 6.0 and 0.005 <= area_fraction <= 0.35:
+            pad_x, pad_y = int(w * 0.08), int(h * 0.15)
+            x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
+            x2, y2 = min(img_w, x + w + pad_x), min(img_h, y + h + pad_y)
+            candidates.append((area_fraction, img[y1:y2, x1:x2]))
+
+    # Largest plausible candidates first; cap at 5 to keep OCR calls sane.
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    return [crop for _area, crop in candidates[:5]]
 
 
 def preprocess_for_ocr(region: np.ndarray) -> np.ndarray:
-    """Grayscale + threshold + upscale small crops to help Tesseract read plates."""
+    """Grayscale + upscale + threshold to help Tesseract read plates.
+
+    Tuned empirically: a moderate upscale (target width ~250px) with a
+    straight Otsu threshold reads plate characters more accurately than
+    a larger upscale or an extra blur step, which tend to soften
+    character edges and cause digit/letter confusion (e.g. 6 vs G).
+    """
     gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-    if gray.shape[1] < 300:
-        scale = 300 / gray.shape[1]
+    target_width = 250
+    if gray.shape[1] != target_width:
+        scale = target_width / gray.shape[1]
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.bilateralFilter(gray, 11, 17, 17)
     _thresh, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return binary
 
@@ -109,7 +155,7 @@ def run_ocr(image_region: np.ndarray, psm: int = 7):
     for text, conf in zip(data["text"], data["conf"]):
         text = text.strip()
         conf = float(conf)
-        if text and conf > 0:
+        if text and conf >= 0:
             results.append({"text": text, "confidence": round(conf / 100, 3)})
     return results
 
