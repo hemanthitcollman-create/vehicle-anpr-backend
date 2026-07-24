@@ -2,7 +2,13 @@
 Vehicle Number Plate Recognition (ANPR) Backend
 -------------------------------------------------
 FastAPI service that accepts an image, locates the number plate region
-using OpenCV, and reads the text on it using EasyOCR.
+using OpenCV, and reads the text on it using Tesseract OCR.
+
+Tesseract is used instead of EasyOCR because EasyOCR pulls in PyTorch,
+which needs far more RAM than low-tier hosting plans (like Railway's
+free/trial tier) provide, causing the process to be OOM-killed.
+Tesseract has no deep-learning-framework dependency and runs
+comfortably in ~512MB of RAM.
 
 Endpoints:
   GET  /health                -> simple health check (used by Railway)
@@ -15,6 +21,7 @@ import logging
 
 import cv2
 import numpy as np
+import pytesseract
 from PIL import Image
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,24 +45,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Lazy-loaded globals -----------------------------------------------
-# EasyOCR's reader is heavy to load, so we build it once, on first use,
-# not at import time. This makes cold starts / health checks faster.
-_ocr_reader = None
 _plate_cascade = None
 
 # Basic pattern for Indian plates, e.g. "KA01AB1234". Adjust/remove
 # this if you need to support other countries' plate formats.
 PLATE_PATTERN = re.compile(r"[A-Z]{2}\s?[0-9]{1,2}\s?[A-Z]{1,3}\s?[0-9]{3,4}")
-
-
-def get_ocr_reader():
-    global _ocr_reader
-    if _ocr_reader is None:
-        import easyocr
-        logger.info("Loading EasyOCR model (first request only)...")
-        _ocr_reader = easyocr.Reader(["en"], gpu=False)
-    return _ocr_reader
 
 
 def get_plate_cascade():
@@ -92,13 +86,32 @@ def locate_plate_regions(img: np.ndarray):
     return crops
 
 
+def preprocess_for_ocr(region: np.ndarray) -> np.ndarray:
+    """Grayscale + threshold + upscale small crops to help Tesseract read plates."""
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    if gray.shape[1] < 300:
+        scale = 300 / gray.shape[1]
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.bilateralFilter(gray, 11, 17, 17)
+    _thresh, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return binary
+
+
 def run_ocr(image_region: np.ndarray):
-    reader = get_ocr_reader()
-    results = reader.readtext(image_region)
-    return [
-        {"text": text, "confidence": round(float(conf), 3)}
-        for (_bbox, text, conf) in results
-    ]
+    processed = preprocess_for_ocr(image_region)
+
+    config = "--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    data = pytesseract.image_to_data(
+        processed, config=config, output_type=pytesseract.Output.DICT
+    )
+
+    results = []
+    for text, conf in zip(data["text"], data["conf"]):
+        text = text.strip()
+        conf = float(conf)
+        if text and conf > 0:
+            results.append({"text": text, "confidence": round(conf / 100, 3)})
+    return results
 
 
 def best_plate_match(texts):
