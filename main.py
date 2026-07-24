@@ -97,10 +97,10 @@ def preprocess_for_ocr(region: np.ndarray) -> np.ndarray:
     return binary
 
 
-def run_ocr(image_region: np.ndarray):
+def run_ocr(image_region: np.ndarray, psm: int = 7):
     processed = preprocess_for_ocr(image_region)
 
-    config = "--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    config = f"--psm {psm} -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     data = pytesseract.image_to_data(
         processed, config=config, output_type=pytesseract.Output.DICT
     )
@@ -146,15 +146,22 @@ async def detect_plate(file: UploadFile = File(...)):
 
     plate_crops = locate_plate_regions(img)
 
-    # If the cascade found no candidate region, fall back to running OCR
-    # on the whole image (works fine for close-up plate photos).
-    regions_to_scan = plate_crops if plate_crops else [img]
-
     all_texts = []
-    for region in regions_to_scan:
-        if region.size == 0:
-            continue
-        all_texts.extend(run_ocr(region))
+    if plate_crops:
+        # Cascade found candidate plate regions: each crop is close to a
+        # single line of text, so psm 7 (single text line) works best.
+        for region in plate_crops:
+            if region.size == 0:
+                continue
+            all_texts.extend(run_ocr(region, psm=7))
+    else:
+        # No candidate region found (common for full car/scene photos).
+        # psm 11 (sparse text) looks for scattered text blocks anywhere
+        # in the image instead of assuming one line, which works much
+        # better here. We also try psm 6 as a second pass since plates
+        # sometimes read better as a single uniform block.
+        all_texts.extend(run_ocr(img, psm=11))
+        all_texts.extend(run_ocr(img, psm=6))
 
     match = best_plate_match(all_texts)
 
