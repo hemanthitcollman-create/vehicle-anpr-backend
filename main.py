@@ -2,7 +2,7 @@
 Vehicle Number Plate Recognition (ANPR) Backend
 -------------------------------------------------
 FastAPI service that accepts an image, locates the number plate region
-using OpenCV, and reads the text on it using PaddleOCR.
+using OpenCV, and reads the text on it using EasyOCR.
 
 Endpoints:
   GET  /health                -> simple health check (used by Railway)
@@ -12,23 +12,23 @@ Endpoints:
 import io
 import re
 import logging
+import os
 
 import cv2
 import numpy as np
 from PIL import Image
-from paddleocr import PaddleOCR
+import easyocr
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-# Set logging to DEBUG so we can see exactly what's happening
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("anpr")
 
 app = FastAPI(
     title="Vehicle Number Plate Recognition API",
     description="Detects and reads vehicle number plates from uploaded images.",
-    version="2.5.0",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -40,8 +40,9 @@ app.add_middleware(
 )
 
 _plate_cascade = None
+_ocr_reader = None
 
-# Standard Indian plate: SS DD LL DDDD (state code, district, series, number)
+# Indian plate patterns
 PLATE_PATTERN = re.compile(r"^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{1,4}$")
 BH_SERIES_PATTERN = re.compile(r"^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$")
 
@@ -56,6 +57,43 @@ PLATE_NOISE_WORDS = {
     "RE", "BH", "HR", "OD", "UP", "TN", "KA", "MH", "DL", "GJ", "RJ",
 }
 
+# Common OCR misreadings mapped to correct characters for plate numbers
+CHAR_CORRECTIONS = {
+    "O": ["0"],
+    "0": ["O"],
+    "I": ["1", "L"],
+    "1": ["I", "L"],
+    "L": ["1", "I"],
+    "S": ["5"],
+    "5": ["S"],
+    "Z": ["2"],
+    "2": ["Z"],
+    "B": ["8"],
+    "8": ["B"],
+    "T": ["7"],
+    "7": ["T"],
+    "G": ["6"],
+    "6": ["G"],
+    "U": ["V"],
+    "V": ["U"],
+    "M": ["N"],
+    "N": ["M"],
+    "R": ["P"],
+    "P": ["R"],
+}
+
+# Characters that are commonly confused
+CONFUSED_PAIRS = {
+    "O": "0", "0": "O",
+    "I": "1", "1": "I",
+    "L": "1",
+    "S": "5", "5": "S",
+    "T": "7", "7": "T",
+    "Z": "2", "2": "Z",
+    "B": "8", "8": "B",
+    "G": "6", "6": "G",
+}
+
 
 def get_plate_cascade():
     global _plate_cascade
@@ -63,6 +101,15 @@ def get_plate_cascade():
         cascade_path = cv2.data.haarcascades + "haarcascade_russian_plate_number.xml"
         _plate_cascade = cv2.CascadeClassifier(cascade_path)
     return _plate_cascade
+
+
+def get_ocr_reader():
+    global _ocr_reader
+    if _ocr_reader is None:
+        logger.info("Loading EasyOCR models (first request only)...")
+        _ocr_reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+        logger.info("EasyOCR models loaded!")
+    return _ocr_reader
 
 
 def read_image(file_bytes: bytes) -> np.ndarray:
@@ -191,7 +238,7 @@ def locate_plate_regions(img: np.ndarray):
 # Image preprocessing
 # ---------------------------------------------------------------------------
 
-def upscale_for_ocr(region: np.ndarray, target_width: int = 800) -> np.ndarray:
+def upscale_for_ocr(region: np.ndarray, target_width: int = 600) -> np.ndarray:
     """CLAHE contrast enhancement + upscale for better OCR."""
     h, w = region.shape[:2]
     if w == 0 or h == 0:
@@ -212,32 +259,12 @@ def upscale_for_ocr(region: np.ndarray, target_width: int = 800) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# OCR (PaddleOCR v3.x predict API)
+# OCR with EasyOCR
 # ---------------------------------------------------------------------------
-
-_ocr_engine = None
-_ocr_loaded = False
-
-
-def get_ocr_engine() -> PaddleOCR:
-    """Lazily construct the PaddleOCR pipeline."""
-    global _ocr_engine, _ocr_loaded
-    if _ocr_engine is None:
-        logger.info("Loading PaddleOCR models (first request only)...")
-        _ocr_engine = PaddleOCR(
-            lang="en",
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=True,
-        )
-        _ocr_loaded = True
-        logger.info("PaddleOCR models loaded successfully!")
-    return _ocr_engine
-
 
 def run_ocr(image_region: np.ndarray, label: str = "unknown"):
     """
-    Run PaddleOCR predict() on an image region.
+    Run EasyOCR on an image region.
     Returns list of {"text": str, "confidence": float}.
     """
     if image_region is None or image_region.size == 0:
@@ -245,29 +272,26 @@ def run_ocr(image_region: np.ndarray, label: str = "unknown"):
         return []
 
     region = upscale_for_ocr(image_region)
-    engine = get_ocr_engine()
+    reader = get_ocr_reader()
 
     try:
-        result = engine.predict(region)
+        results = reader.readtext(region, detail=1, paragraph=False)
     except Exception as e:
-        logger.error(f"  [{label}] PaddleOCR predict() FAILED with exception: {e}")
+        logger.error(f"  [{label}] EasyOCR FAILED: {e}")
         return []
 
-    results = []
-    for page in result:
-        texts = page.get("rec_texts", []) if hasattr(page, "get") else getattr(page, "rec_texts", [])
-        scores = page.get("rec_scores", []) if hasattr(page, "get") else getattr(page, "rec_scores", [])
-        for text, score in zip(texts, scores):
-            text = (text or "").strip()
-            if text:
-                results.append({"text": text, "confidence": round(float(score), 3)})
+    ocr_results = []
+    for (box, text, conf) in results:
+        text = (text or "").strip()
+        if text:
+            ocr_results.append({"text": text, "confidence": round(float(conf), 3)})
 
-    if not results:
-        logger.warning(f"  [{label}] PaddleOCR returned NO text")
+    if not ocr_results:
+        logger.warning(f"  [{label}] EasyOCR returned NO text")
     else:
-        logger.info(f"  [{label}] Found {len(results)} text(s): {[(r['text'], r['confidence']) for r in results]}")
+        logger.info(f"  [{label}] Found {len(ocr_results)} text(s): {[(r['text'], r['confidence']) for r in ocr_results]}")
 
-    return results
+    return ocr_results
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +380,54 @@ def best_plate_match(texts, region_scores=None):
 
 
 # ---------------------------------------------------------------------------
+# Plate segment combination
+# ---------------------------------------------------------------------------
+
+def try_combine_plate_segments(texts):
+    """
+    Try combining multiple OCR text segments to form a valid plate.
+    OCR often splits a 2-line plate into separate segments.
+    """
+    logger.info("--- Trying to combine plate segments ---")
+    plate_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+
+    for i in range(len(texts)):
+        for j in range(i + 1, len(texts)):
+            text_a = normalize_text(texts[i]["text"])
+            text_b = normalize_text(texts[j]["text"])
+            combined = text_a + text_b
+
+            # Check if combined matches plate format
+            if is_valid_plate_format(combined):
+                confidence = (texts[i]["confidence"] + texts[j]["confidence"]) / 2.0
+                logger.info(f"  COMBINED: '{text_a}' + '{text_b}' = '{combined}' (valid!)")
+                return {
+                    "text": combined,
+                    "confidence": round(confidence, 3),
+                    "score": round(confidence * 0.8 + 0.95 * 0.2, 3),
+                }
+
+            # Try with character corrections
+            for char_a, replacements_a in CHAR_CORRECTIONS.items():
+                for rep_a in replacements_a:
+                    corrected_a = text_a.replace(char_a, rep_a)
+                    for char_b, replacements_b in CHAR_CORRECTIONS.items():
+                        for rep_b in replacements_b:
+                            corrected_b = text_b.replace(char_b, rep_b)
+                            combined2 = corrected_a + corrected_b
+                            if is_valid_plate_format(combined2):
+                                confidence = (texts[i]["confidence"] + texts[j]["confidence"]) / 2.0
+                                logger.info(f"  COMBINED+CORRECTED: '{corrected_a}' + '{corrected_b}' = '{combined2}'")
+                                return {
+                                    "text": combined2,
+                                    "confidence": round(confidence, 3),
+                                    "score": round(confidence * 0.6 + 0.95 * 0.4, 3),
+                                }
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # API Endpoints
 # ---------------------------------------------------------------------------
 
@@ -385,11 +457,11 @@ async def detect_plate(file: UploadFile = File(...)):
     next_idx = 0
 
     # ============================================================
-    # STRATEGY 1: Full-image OCR (no preprocessing)
+    # STRATEGY 1: Full-image OCR
     # ============================================================
     logger.info("--- Strategy 1: Full-image OCR ---")
-    full_image_results = run_ocr(img, "full_image")
-    for res in full_image_results:
+    full_results = run_ocr(img, "full_image")
+    for res in full_results:
         res["region_index"] = next_idx
         all_texts.append(res)
     region_scores[next_idx] = 0.5
@@ -398,14 +470,19 @@ async def detect_plate(file: UploadFile = File(...)):
     match = best_plate_match(all_texts, region_scores)
 
     # ============================================================
-    # STRATEGY 2: Targeted re-OCR on bottom region
+    # STRATEGY 2: Try combining segments
     # ============================================================
     if match is None:
-        logger.info("--- Strategy 2: Targeted re-OCR on bottom region ---")
+        match = try_combine_plate_segments(all_texts)
+
+    # ============================================================
+    # STRATEGY 3: Targeted re-OCR on bottom region
+    # ============================================================
+    if match is None:
+        logger.info("--- Strategy 3: Targeted re-OCR on bottom region ---")
         has_partial = any(_looks_like_plate_partial(t["text"]) for t in all_texts)
         if has_partial:
             logger.info("  Found partial plate-like text, running targeted re-OCR")
-            # Crop the bottom 65% of the image and run OCR
             crop_y1 = int(img_h * 0.60)
             crop = img[crop_y1:, :]
 
@@ -424,14 +501,18 @@ async def detect_plate(file: UploadFile = File(...)):
             next_idx += 1
 
             match = best_plate_match(all_texts, region_scores)
+
+            # Try combining again with new results
+            if match is None:
+                match = try_combine_plate_segments(all_texts)
         else:
             logger.info("  No partial plate-like text found, skipping targeted re-OCR")
 
     # ============================================================
-    # STRATEGY 3: OpenCV-based localization
+    # STRATEGY 4: OpenCV-based localization
     # ============================================================
     if match is None:
-        logger.info("--- Strategy 3: OpenCV-based localization ---")
+        logger.info("--- Strategy 4: OpenCV-based localization ---")
         plate_crops, plate_boxes = locate_plate_regions(img)
         logger.info(f"  Found {len(plate_crops)} plate region candidates")
 
@@ -453,10 +534,14 @@ async def detect_plate(file: UploadFile = File(...)):
 
         match = best_plate_match(all_texts, region_scores)
 
+        # Try combining one more time
+        if match is None:
+            match = try_combine_plate_segments(all_texts)
+
     logger.info(f"=== RESULT: best_match={match} ===")
 
     return JSONResponse({
-        "plate_regions_found": len(plate_boxes) if match is None else 0,
+        "plate_regions_found": len(plate_boxes) if 'plate_boxes' in dir() else 0,
         "best_match": match,
         "all_detected_text": [
             {"text": t["text"], "confidence": t["confidence"], "region_index": t.get("region_index")}
