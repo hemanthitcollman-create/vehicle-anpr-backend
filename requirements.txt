@@ -4,4 +4,4 @@ python-multipart==0.0.9
 opencv-python-headless==4.10.0.84
 numpy>=1.26,<3.0
 pillow==10.4.0
-easyocr==1.7.2
+google-cloud-vision==3.7.4
