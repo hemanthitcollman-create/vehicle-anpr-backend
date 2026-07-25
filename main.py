@@ -2,7 +2,28 @@
 Vehicle Number Plate Recognition (ANPR) Backend
 -------------------------------------------------
 FastAPI service that accepts an image, locates the number plate region
-using OpenCV, and reads the text on it using Google Cloud Vision API.
+using OpenCV, and reads the text on it using Tesseract OCR.
+
+Tesseract is used instead of EasyOCR/PaddleOCR because it has no
+ML-framework dependency and runs comfortably within low-tier hosting
+RAM limits (like Railway's free/trial tier). A PaddleOCR variant was
+tried and reads plates more accurately, but requires noticeably more
+RAM to load its models -- if you're on a constrained Railway plan,
+this Tesseract version is the stable, deployable fallback.
+
+Plate localization uses three passes, merged together:
+  1. Haar cascade (fast, but trained on Russian-style plates so it
+     frequently misses Indian ones)
+  2. Colour-mask detection tuned for Indian plates -- yellow background
+     (commercial vehicles) or white background (private vehicles) with
+     dark text, since that's a much stronger signal than generic edges
+  3. Generic contour-based detection (bright, rectangular, high-contrast
+     region) as a catch-all fallback
+
+Detected regions are OCR'd individually and only text that matches the
+Indian plate format is considered a candidate -- this stops large,
+high-contrast text elsewhere in the photo (ad banners, stickers, phone
+numbers on auto-rickshaws etc.) from being picked as the plate.
 
 Endpoints:
   GET  /health                -> simple health check (used by Railway)
@@ -10,20 +31,16 @@ Endpoints:
 """
 
 import io
-import os
 import re
-import base64
 import logging
 
 import cv2
 import numpy as np
+import pytesseract
 from PIL import Image
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-
-# Google Cloud Vision
-from google.cloud import vision
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("anpr")
@@ -31,7 +48,7 @@ logger = logging.getLogger("anpr")
 app = FastAPI(
     title="Vehicle Number Plate Recognition API",
     description="Detects and reads vehicle number plates from uploaded images.",
-    version="4.0.0",
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -44,19 +61,15 @@ app.add_middleware(
 
 _plate_cascade = None
 
-# Indian plate patterns
-PLATE_PATTERN = re.compile(r"^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{1,4}$")
+# Standard Indian plate: SS DD LL DDDD (state code, district, series, number)
+# e.g. "MH12NW8556", "KA01AB1234". BH-series ("22BH1234AB") handled separately.
+PLATE_PATTERN = re.compile(r"^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{4}$")
 BH_SERIES_PATTERN = re.compile(r"^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$")
 
 VALID_STATE_CODES = {
     "AP", "AR", "AS", "BR", "CG", "GA", "GJ", "HR", "HP", "JH", "KA", "KL",
     "MP", "MH", "MN", "ML", "MZ", "NL", "OD", "PB", "RJ", "SK", "TN", "TS",
     "TR", "UP", "UK", "WB", "AN", "CH", "DN", "DD", "DL", "JK", "LA", "LD", "PY",
-}
-
-PLATE_NOISE_WORDS = {
-    "IND", "INDIA", "BHARAT", "BS", "BS4", "BS6", "CNG", "LPG",
-    "RE", "BH", "HR", "OD", "UP", "TN", "KA", "MH", "DL", "GJ", "RJ",
 }
 
 
@@ -77,7 +90,7 @@ def read_image(file_bytes: bytes) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Plate region localization (OpenCV-based)
+# Plate region localization
 # ---------------------------------------------------------------------------
 
 def _iou(box_a, box_b) -> float:
@@ -95,6 +108,7 @@ def _iou(box_a, box_b) -> float:
 
 
 def _dedupe_boxes(boxes, iou_thresh: float = 0.4):
+    """Drop boxes that heavily overlap an already-kept box (keeps the first/larger one)."""
     boxes = sorted(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
     kept = []
     for b in boxes:
@@ -103,12 +117,28 @@ def _dedupe_boxes(boxes, iou_thresh: float = 0.4):
     return kept
 
 
+def _haar_boxes(eq_gray: np.ndarray):
+    cascade = get_plate_cascade()
+    plates = cascade.detectMultiScale(eq_gray, scaleFactor=1.1, minNeighbors=4, minSize=(60, 20))
+    boxes = []
+    for (x, y, w, h) in plates:
+        pad_x, pad_y = int(w * 0.1), int(h * 0.2)
+        boxes.append((x - pad_x, y - pad_y, x + w + pad_x, y + h + pad_y))
+    return boxes
+
+
 def _color_mask_boxes(img: np.ndarray):
-    """Detect yellow/white plate regions using HSV color masking."""
+    """
+    Indian plates are almost always solid yellow (commercial) or solid
+    white (private) with a dark, high-contrast rectangle shape. Masking
+    for those colours directly is a much stronger signal than generic
+    edge detection, and importantly does NOT get confused by colourful
+    ad banners/stickers the way edge-based methods do.
+    """
     img_h, img_w = img.shape[:2]
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-    yellow_mask = cv2.inRange(hsv, (15, 50, 50), (40, 255, 255))
+    yellow_mask = cv2.inRange(hsv, (15, 80, 80), (35, 255, 255))
     white_mask = cv2.inRange(hsv, (0, 0, 170), (180, 40, 255))
 
     boxes = []
@@ -123,25 +153,21 @@ def _color_mask_boxes(img: np.ndarray):
                 continue
             aspect_ratio = w / h
             area_fraction = (w * h) / (img_w * img_h)
-            if 1.5 <= aspect_ratio <= 8.0 and 0.001 <= area_fraction <= 0.30:
-                vertical_center = y + h / 2
-                if vertical_center > img_h * 0.5:
-                    pad_x, pad_y = int(w * 0.1), int(h * 0.25)
-                    boxes.append((
-                        max(0, x - pad_x), max(0, y - pad_y),
-                        min(img_w, x + w + pad_x), min(img_h, y + h + pad_y)
-                    ))
+
+            if 2.0 <= aspect_ratio <= 6.0 and 0.003 <= area_fraction <= 0.30:
+                pad_x, pad_y = int(w * 0.08), int(h * 0.2)
+                boxes.append((x - pad_x, y - pad_y, x + w + pad_x, y + h + pad_y))
+
     return boxes
 
 
 def _contour_boxes(gray: np.ndarray):
-    """Detect rectangular regions using edge detection."""
     blurred = cv2.bilateralFilter(gray, 13, 15, 15)
     edged = cv2.Canny(blurred, 30, 200)
     edged = cv2.dilate(edged, np.ones((3, 3), np.uint8), iterations=1)
 
     contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:20]
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:15]
 
     img_h, img_w = gray.shape[:2]
     boxes = []
@@ -151,125 +177,74 @@ def _contour_boxes(gray: np.ndarray):
             continue
         aspect_ratio = w / h
         area_fraction = (w * h) / (img_w * img_h)
-        if 1.5 <= aspect_ratio <= 8.0 and 0.001 <= area_fraction <= 0.35:
-            pad_x, pad_y = int(w * 0.1), int(h * 0.15)
-            boxes.append((
-                max(0, x - pad_x), max(0, y - pad_y),
-                min(img_w, x + w + pad_x), min(img_h, y + h + pad_y)
-            ))
-    return boxes
-
-
-def _bottom_region_boxes(img: np.ndarray):
-    """Always crop the bottom portion of the image."""
-    img_h, img_w = img.shape[:2]
-    boxes = []
-    boxes.append((0, int(img_h * 0.70), img_w, img_h))
-    boxes.append((int(img_w * 0.2), int(img_h * 0.65), img_w, img_h))
+        if 2.0 <= aspect_ratio <= 6.0 and 0.005 <= area_fraction <= 0.35:
+            pad_x, pad_y = int(w * 0.08), int(h * 0.15)
+            boxes.append((x - pad_x, y - pad_y, x + w + pad_x, y + h + pad_y))
     return boxes
 
 
 def locate_plate_regions(img: np.ndarray):
-    """Merge all OpenCV-based plate region candidates."""
+    """
+    Merge candidates from colour-mask detection (most reliable for
+    Indian plates), the Haar cascade, and generic contour detection.
+    Returns (crops, boxes), deduped and capped so OCR calls stay bounded.
+    """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    eq = cv2.equalizeHist(gray)
     img_h, img_w = gray.shape[:2]
 
     color_boxes = _color_mask_boxes(img)
-    contour_boxes = _contour_boxes(gray)
-    bottom_boxes = _bottom_region_boxes(img)
+    haar_boxes = _haar_boxes(eq)
+    contour_boxes = _contour_boxes(gray) if not color_boxes else []  # only fall back if colour mask found nothing
 
-    all_boxes = color_boxes + contour_boxes + bottom_boxes
+    all_boxes = color_boxes + haar_boxes + contour_boxes
     all_boxes = [
         (max(0, x1), max(0, y1), min(img_w, x2), min(img_h, y2))
         for (x1, y1, x2, y2) in all_boxes
         if x2 > x1 and y2 > y1
     ]
-    all_boxes = _dedupe_boxes(all_boxes)[:10]
+    all_boxes = _dedupe_boxes(all_boxes)[:6]  # cap OCR calls
 
     crops = [img[y1:y2, x1:x2] for (x1, y1, x2, y2) in all_boxes]
     return crops, all_boxes
 
 
 # ---------------------------------------------------------------------------
-# Image preprocessing
+# OCR
 # ---------------------------------------------------------------------------
 
-def upscale_for_ocr(region: np.ndarray, target_width: int = 600) -> np.ndarray:
-    """CLAHE contrast enhancement + upscale for better OCR."""
-    h, w = region.shape[:2]
-    if w == 0 or h == 0:
-        return region
-
-    lab = cv2.cvtColor(region, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-    lab = cv2.merge([l, a, b])
-    region = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-    if w < target_width:
-        scale = target_width / w
-        region = cv2.resize(region, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-    return region
+def preprocess_for_ocr(region: np.ndarray) -> np.ndarray:
+    """Grayscale + upscale + threshold to help Tesseract read plates."""
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    target_width = 250
+    if gray.shape[1] > 0 and gray.shape[1] != target_width:
+        scale = target_width / gray.shape[1]
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    _thresh, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return binary
 
 
-# ---------------------------------------------------------------------------
-# OCR with Google Cloud Vision
-# ---------------------------------------------------------------------------
-
-def image_to_base64_png(region: np.ndarray) -> bytes:
-    """Convert a BGR image to base64-encoded PNG."""
-    _, buffer = cv2.imencode('.png', region)
-    return buffer.tobytes()
-
-
-def run_vision_ocr(image_bytes: bytes, label: str = "unknown"):
-    """
-    Run Google Cloud Vision OCR on image bytes.
-    Returns list of {"text": str, "confidence": float}.
-    """
-    if not image_bytes:
-        logger.warning(f"  [{label}] Empty image, skipping Vision OCR")
+def run_ocr(image_region: np.ndarray, psm: int = 7):
+    if image_region is None or image_region.size == 0:
         return []
+    processed = preprocess_for_ocr(image_region)
 
-    client = vision.ImageAnnotatorClient()
-    image = vision.Image(content=image_bytes)
-
-    try:
-        response = client.text_detection(image=image)
-    except Exception as e:
-        logger.error(f"  [{label}] Google Vision OCR FAILED: {e}")
-        return []
+    config = f"--psm {psm} -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    data = pytesseract.image_to_data(
+        processed, config=config, output_type=pytesseract.Output.DICT
+    )
 
     results = []
-    texts = response.text_annotations
-    if texts:
-        for annotation in texts:
-            text = annotation.description.strip()
-            if text:
-                # text_annotations[0] is the full text, rest are individual words
-                # We return all of them
-                results.append({"text": text, "confidence": 1.0})
-
-    if not results:
-        logger.warning(f"  [{label}] Google Vision returned NO text")
-    else:
-        texts_found = [r['text'] for r in results]
-        logger.info(f"  [{label}] Found {len(results)} text(s): {texts_found}")
-
+    for text, conf in zip(data["text"], data["conf"]):
+        text = text.strip()
+        conf = float(conf)
+        if text and conf >= 0:
+            results.append({"text": text, "confidence": round(conf / 100, 3)})
     return results
 
 
-def run_vision_ocr_on_crop(crop: np.ndarray, label: str = "crop"):
-    """Run Vision OCR on a preprocessed crop."""
-    enhanced = upscale_for_ocr(crop)
-    img_bytes = image_to_base64_png(enhanced)
-    return run_vision_ocr(img_bytes, label)
-
-
 # ---------------------------------------------------------------------------
-# Text normalization + validation
+# Text normalization + validation + scoring
 # ---------------------------------------------------------------------------
 
 def normalize_text(raw: str) -> str:
@@ -284,54 +259,46 @@ def is_valid_plate_format(cleaned: str) -> bool:
     return False
 
 
+def looks_like_phone_number(cleaned: str) -> bool:
+    digits = re.sub(r"\D", "", cleaned)
+    return len(digits) >= 10 and digits == cleaned
+
+
+def looks_like_pure_word(cleaned: str) -> bool:
+    return cleaned.isalpha()
+
+
 def is_obviously_not_a_plate(cleaned: str) -> bool:
     if not cleaned:
         return True
-    digits = re.sub(r"\D", "", cleaned)
-    if len(digits) >= 10 and digits == cleaned:
+    if looks_like_phone_number(cleaned):
         return True
-    if cleaned.isalpha():
+    if looks_like_pure_word(cleaned):
         return True
     if len(cleaned) < 6 or len(cleaned) > 11:
         return True
     return False
 
 
-def _looks_like_plate_partial(text: str) -> bool:
-    """Check if text could be a partial plate number."""
-    cleaned = normalize_text(text)
-    if len(cleaned) < 3 or len(cleaned) > 7:
-        return False
-    if not any(c.isdigit() for c in cleaned):
-        return False
-    if cleaned.isdigit() and len(cleaned) >= 7:
-        return False
-    if cleaned in PLATE_NOISE_WORDS:
-        return False
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Plate matching
-# ---------------------------------------------------------------------------
-
 def best_plate_match(texts, region_scores=None):
-    """Pick the OCR result that best matches a valid Indian plate format."""
+    """
+    Pick the OCR result that best matches a valid Indian plate format,
+    scoring by OCR confidence + which region source it came from
+    (colour-mask/lower-frame regions are more trustworthy).
+    """
     region_scores = region_scores or {}
     candidates = []
 
     for item in texts:
         cleaned = normalize_text(item["text"])
         if is_obviously_not_a_plate(cleaned):
-            logger.debug(f"  REJECTED '{cleaned}' - obviously not a plate")
             continue
         if not is_valid_plate_format(cleaned):
-            logger.debug(f"  REJECTED '{cleaned}' - invalid plate format")
-            continue
+            continue  # hard reject non-plate-shaped strings
 
         region_bonus = region_scores.get(item.get("region_index"), 0.5)
         score = (item["confidence"] * 0.6) + (region_bonus * 0.4)
-        logger.info(f"  CANDIDATE '{cleaned}' score={score:.3f}")
+
         candidates.append({
             "text": item["text"],
             "confidence": item["confidence"],
@@ -340,22 +307,10 @@ def best_plate_match(texts, region_scores=None):
         })
 
     if not candidates:
-        logger.info("  No valid plate candidates found")
         return None
-
     candidates.sort(key=lambda c: c["score"], reverse=True)
-    best = candidates[0]
-    logger.info(f"  BEST MATCH: {best['normalized']} (score={best['score']})")
-    return {
-        "text": best["normalized"],
-        "confidence": best["confidence"],
-        "score": best["score"],
-    }
+    return candidates[0]
 
-
-# ---------------------------------------------------------------------------
-# API Endpoints
-# ---------------------------------------------------------------------------
 
 @app.get("/health")
 def health():
@@ -374,82 +329,38 @@ async def detect_plate(file: UploadFile = File(...)):
 
     file_bytes = await file.read()
     img = read_image(file_bytes)
-    img_h, img_w = img.shape[:2]
 
-    logger.info(f"=== DETECT-PLATE START === Image: {img_w}x{img_h}, {len(file_bytes)} bytes")
+    plate_crops, plate_boxes = locate_plate_regions(img)
 
     all_texts = []
     region_scores = {}
-    next_idx = 0
-    plate_boxes = []
 
-    # ============================================================
-    # STRATEGY 1: Full-image Google Vision OCR
-    # ============================================================
-    logger.info("--- Strategy 1: Full-image Vision OCR ---")
-    img_png = image_to_base64_png(img)
-    full_results = run_vision_ocr(img_png, "full_image")
-    for res in full_results:
-        res["region_index"] = next_idx
-        all_texts.append(res)
-    region_scores[next_idx] = 0.5
-    next_idx += 1
-
-    match = best_plate_match(all_texts, region_scores)
-
-    # ============================================================
-    # STRATEGY 2: Bottom region Vision OCR
-    # ============================================================
-    if match is None:
-        logger.info("--- Strategy 2: Bottom region Vision OCR ---")
-        crop_y1 = int(img_h * 0.65)
-        crop = img[crop_y1:, :]
-        crop_png = image_to_base64_png(crop)
-        bottom_results = run_vision_ocr(crop_png, "bottom_region")
-        for res in bottom_results:
-            cleaned = normalize_text(res["text"])
-            if cleaned in PLATE_NOISE_WORDS:
-                continue
-            res["region_index"] = next_idx
-            all_texts.append(res)
-        region_scores[next_idx] = 0.95
-        next_idx += 1
-
-        match = best_plate_match(all_texts, region_scores)
-
-    # ============================================================
-    # STRATEGY 3: OpenCV-based localization + Vision OCR on crops
-    # ============================================================
-    if match is None:
-        logger.info("--- Strategy 3: OpenCV localization + Vision OCR ---")
-        plate_crops, plate_boxes = locate_plate_regions(img)
-        logger.info(f"  Found {len(plate_crops)} plate region candidates")
-
+    if plate_crops:
+        img_h = img.shape[0]
         for idx, (region, box) in enumerate(zip(plate_crops, plate_boxes)):
             _x1, y1, _x2, y2 = box
             vertical_center = (y1 + y2) / 2
-            if vertical_center > img_h * 0.65:
-                region_scores[next_idx] = 0.9
-            elif vertical_center > img_h * 0.45:
-                region_scores[next_idx] = 0.7
-            else:
-                region_scores[next_idx] = 0.3
+            region_scores[idx] = 0.7 if vertical_center > img_h * 0.4 else 0.4
 
-            region_results = run_vision_ocr_on_crop(region, f"opencv_crop_{next_idx}")
-            for res in region_results:
-                res["region_index"] = next_idx
+            for res in run_ocr(region, psm=7):
+                res["region_index"] = idx
                 all_texts.append(res)
-            next_idx += 1
+            for res in run_ocr(region, psm=8):
+                res["region_index"] = idx
+                all_texts.append(res)
+    else:
+        # No candidate region found at all -- fall back to sparse full-image OCR.
+        for res in run_ocr(img, psm=11):
+            res["region_index"] = None
+            all_texts.append(res)
+        for res in run_ocr(img, psm=6):
+            res["region_index"] = None
+            all_texts.append(res)
 
-        match = best_plate_match(all_texts, region_scores)
-
-    logger.info(f"=== RESULT: best_match={match} ===")
+    match = best_plate_match(all_texts, region_scores)
 
     return JSONResponse({
-        "plate_regions_found": len(plate_boxes) if match is None else 0,
+        "plate_regions_found": len(plate_crops),
         "best_match": match,
-        "all_detected_text": [
-            {"text": t["text"], "confidence": t["confidence"], "region_index": t.get("region_index")}
-            for t in all_texts
-        ],
+        "all_detected_text": all_texts,
     })
